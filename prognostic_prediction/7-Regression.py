@@ -24,20 +24,21 @@ from lifelines.statistics import logrank_test as log_rank_test
 # Resolve shared modules independently of the current working directory.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "align_utils"))
 from prognostic_models import GatedSlideEncoder
+from cv_protocol import (PROTOCOL_VERSION, BestCheckpoint, make_inner_split,
+                         record_fold_split, save_json)
 
 # --- Global Configuration ---
 DEVICE = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
 INPUT_DIM = 64
 N_SPLITS = 10
 MAX_EPOCHS = 150
-PATIENCE = 30
+VALIDATION_FRACTION = 0.2  # Fraction of outer TRAINING patients only.
 L_DIM = 32     
 N_HEADS = 4    
 GLOBAL_MODE = 'attention'
 TEST_SEEDS = [42, 44, 46, 48, 50]
 
-SAVE_DIR = Path("./checkpoints/mtl_multihead_gated_v2")  # Keep historical model files separate.
-SAVE_DIR.mkdir(parents=True, exist_ok=True)
+SAVE_DIR = Path("./checkpoints/huigui_mtl_outercv_v3")
 
 
 def validate_fold_partition(splits, n_samples):
@@ -160,6 +161,11 @@ class GatedMTLSurvivalMIL(GatedSlideEncoder):
 # ==========================================
 def run_experiment(seed, df, feat_root):
     set_seed(seed)
+    if df['case_submitter_id'].astype(str).duplicated().any():
+        raise ValueError('Duplicate patient IDs; refusing patient-overlapping CV.')
+    SAVE_DIR.mkdir(parents=True, exist_ok=True)
+    seed_dir = SAVE_DIR / f'seed_{seed}'
+    seed_dir.mkdir(parents=True, exist_ok=True)
     class_counts = df['label'].value_counts()
     if len(class_counts) < 2 or class_counts.min() < N_SPLITS:
         raise ValueError(
@@ -174,15 +180,29 @@ def run_experiment(seed, df, feat_root):
     splits = list(skf.split(df, df['label']))
     validate_fold_partition(splits, len(df))
 
-    for fold, (train_idx, val_idx) in enumerate(splits):
+    fold_records = []
+    labels = df['label'].to_numpy()
+    patient_ids = df['case_submitter_id'].astype(str).tolist()
+    for fold, (development_idx, test_idx) in enumerate(splits):
+        train_idx, validation_idx, inner_seed = make_inner_split(
+            development_idx, test_idx, labels, seed, fold, VALIDATION_FRACTION,
+        )
+        split = record_fold_split(
+            seed_dir / f"split_fold_{fold}.json", patient_ids,
+            train_idx, validation_idx, test_idx, seed, fold, inner_seed,
+            VALIDATION_FRACTION, 'C-index', MAX_EPOCHS,
+        )
         tr_df = df.iloc[train_idx]
         tr_loader = DataLoader(SurvivalDataset(tr_df, feat_root), batch_size=1, shuffle=True)
         model = GatedMTLSurvivalMIL(L=L_DIM, n_heads=N_HEADS).to(DEVICE)
         optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0.05)
         
-        best_c = -1
-        fold_path = SAVE_DIR / f"best_model_seed{seed}_fold{fold}.pth"
-        patience = 0
+        selection = BestCheckpoint()
+        fold_path = seed_dir / f"best_model_fold{fold}.pth"
+        history = []
+        print(f"Seed {seed} fold {fold + 1}/{N_SPLITS}: "
+              f"train={len(train_idx)}, internal_validation={len(validation_idx)}, "
+              f"outer_test={len(test_idx)}", flush=True)
         
         for epoch in range(1, MAX_EPOCHS + 1):
             model.train()
@@ -197,39 +217,47 @@ def run_experiment(seed, df, feat_root):
                     if len(rs) > 1:
                         loss_cox = cox_loss(torch.cat(rs), torch.cat(ds), torch.cat(es))
                         loss_total = loss_cox + alpha * (cls_loss_acc / len(rs))
+                        if not torch.isfinite(loss_total):
+                            raise ValueError('Nonfinite training loss')
                         optimizer.zero_grad(); loss_total.backward(); optimizer.step()
                     rs, ds, es, cls_loss_acc = [], [], [], 0
             
             model.eval()
             v_r, v_d, v_e = [], [], []
             with torch.no_grad():
-                for idx_v in val_idx:
+                for idx_v in validation_idx:
                     row_v = df.iloc[idx_v]
                     feat_v = F.normalize(torch.load(feat_root / f"{row_v['case_submitter_id']}.pt", map_location='cpu')['features'], p=2, dim=1).to(DEVICE)
                     r, _ = model(feat_v)
                     v_r.append(r.item()); v_d.append(row_v['OS_days']); v_e.append(row_v['event_status'])
             
-            try: c = concordance_index(v_d, -np.array(v_r), v_e)
-            except: c = 0.5
-            
-            if c > best_c:
-                best_c = c; torch.save(model.state_dict(), fold_path); patience = 0
-            else: patience += 1
-            if patience >= PATIENCE: break
-        
-        # Every fold contributes predictions; no performance-based filtering.
-        model.load_state_dict(torch.load(fold_path, map_location=DEVICE))
+            # Undefined validation metrics must not silently become 0.5.
+            c = concordance_index(v_d, -np.array(v_r), v_e)
+            improved = selection.update(c, epoch)
+            if improved:
+                torch.save(model.state_dict(), fold_path)
+            history.append({'epoch': epoch, 'validation_c_index': float(c)})
+            if epoch == 1 or epoch % 10 == 0 or epoch == MAX_EPOCHS:
+                save_json(seed_dir / f"progress_fold_{fold}.json", {
+                    'status': 'selecting_on_internal_validation', 'seed': seed, 'fold': fold,
+                    'epochs_run': epoch, 'best_epoch': selection.best_epoch, 'history': history,
+                })
+                print(f"  epoch={epoch} internal_val_C-index={c:.4f} "
+                      f"best_epoch={selection.best_epoch}", flush=True)
+
+        # Outer test patients are evaluated only AFTER checkpoint selection.
+        model.load_state_dict(torch.load(fold_path, map_location=DEVICE, weights_only=True))
         model.eval()
         fold_scores = []
         with torch.no_grad():
-            for idx_v in val_idx:
+            for idx_v in test_idx:
                 row_v = df.iloc[idx_v]
                 feat_v = F.normalize(torch.load(feat_root / f"{row_v['case_submitter_id']}.pt", map_location='cpu')['features'], p=2, dim=1).to(DEVICE)
                 tta = [model(feat_v + torch.randn_like(feat_v)*0.0005)[0].item() for _ in range(10)]
                 fold_scores.append(np.mean(tta))
 
-        fold_days = df.iloc[val_idx]['OS_days'].to_numpy()
-        fold_events = df.iloc[val_idx]['event_status'].to_numpy()
+        fold_days = df.iloc[test_idx]['OS_days'].to_numpy()
+        fold_events = df.iloc[test_idx]['event_status'].to_numpy()
         try:
             fold_c = concordance_index(
                 fold_days,
@@ -241,11 +269,28 @@ def run_experiment(seed, df, feat_root):
         fold_c_indices.append(fold_c)
 
         ranks = pd.Series(fold_scores).rank(pct=True).to_numpy()
-        assign_oof(oof_ranks, oof_counts, val_idx, ranks)
+        assign_oof(oof_ranks, oof_counts, test_idx, ranks)
+        record = {
+            'protocol': PROTOCOL_VERSION, 'seed': seed, 'fold': fold,
+            'epochs_run': epoch, 'best_epoch': selection.best_epoch,
+            'best_internal_validation_score': selection.best_score,
+            'test_c_index': float(fold_c), 'history': history,
+            'train_patients': split['train_patients'],
+            'validation_patients': split['validation_patients'],
+            'test_patients': split['test_patients'],
+            'test_predictions': [
+                {'patient_id': patient_ids[i], 'days': float(df.iloc[i]['OS_days']),
+                 'event': int(df.iloc[i]['event_status']), 'risk': float(risk),
+                 'within_fold_risk_percentile': float(rank)}
+                for i, risk, rank in zip(test_idx, fold_scores, ranks)
+            ],
+        }
+        save_json(seed_dir / f"result_fold_{fold}.json", record)
+        fold_records.append(record)
         fold_text = f"{fold_c:.4f}" if np.isfinite(fold_c) else "undefined"
         print(
             f"Seed {seed} fold {fold + 1}/{N_SPLITS} "
-            f"held-out C-index: {fold_text}"
+            f"outer-test C-index: {fold_text} epochs_run={epoch} best_epoch={selection.best_epoch}"
         )
 
     require_complete_oof(oof_counts)
@@ -260,13 +305,16 @@ def run_experiment(seed, df, feat_root):
         event_observed_A=all_events[high_risk],
         event_observed_B=all_events[~high_risk]
     )
-    return build_regression_result(
+    result = build_regression_result(
         fold_c_indices,
         pooled_oof_c_index=pooled_oof_c_index,
         pooled_logrank_p=lr_results.p_value,
         coverage=int(oof_counts.sum()),
         n_samples=len(df),
     )
+    result.update(protocol=PROTOCOL_VERSION, seed=int(seed), folds=fold_records)
+    save_json(seed_dir / 'result.json', result)
+    return result
 
 # ==========================================
 # 4. Main Program
@@ -325,9 +373,9 @@ def main():
             result['pooled_logrank_p'] for result in seed_results
         ]
         print("\n" + "="*75)
-        print(f"FINAL TRUE {N_SPLITS}-FOLD STATISTICS (MTL + SE + MultiHead)")
+        print(f"FINAL OUTER-TEST {N_SPLITS}-FOLD STATISTICS (MTL + SE + MultiHead)")
         print(f"Per-seed fold mean C-index: {[round(x, 4) for x in seed_fold_means]}")
-        print(f"Mean C-index: {np.mean(seed_fold_means):.4f} +/- {np.std(seed_fold_means):.4f}")
+        print(f"Mean C-index: {np.mean(seed_fold_means):.4f} +/- {np.std(seed_fold_means, ddof=1):.4f}")
         print(f"Per-seed pooled OOF C-index: {[round(x, 4) for x in seed_pooled_c_indices]}")
         print(f"Mean pooled OOF C-index: {np.mean(seed_pooled_c_indices):.4f}")
         print(f"Median pooled OOF P-value: {np.median(pooled_p_values):.2e}")

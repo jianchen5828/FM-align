@@ -15,6 +15,8 @@ from sklearn.metrics import accuracy_score, confusion_matrix, roc_auc_score
 # Resolve shared modules independently of the current working directory.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "align_utils"))
 from prognostic_models import GatedSlideEncoder
+from cv_protocol import (PROTOCOL_VERSION, BestCheckpoint, make_inner_split,
+                         record_fold_split, save_json)
 
 # ==========================================
 # 1. Environment Configuration and Hyperparameters
@@ -24,7 +26,9 @@ INPUT_DIM = 64
 N_SPLITS = 6 
 MONITOR_MODE = "ACC" 
 SAMPLE_SIZE = 256
-CHECKPOINT_ROOT = Path("./checkpoints_brca_mil_gated_v2")  # Keep historical model files separate.
+MAX_EPOCHS = 100
+VALIDATION_FRACTION = 0.2  # Fraction of outer TRAINING patients only.
+CHECKPOINT_ROOT = Path("./checkpoints_brca_mil_outercv_v3")
 TEST_SEEDS = [44, 46, 48, 50, 52]  # Define 5 seeds
 
 
@@ -138,6 +142,8 @@ class SprintDataset(Dataset):
 def train_and_validate(seed, df, feat_root):
     set_seed(seed)
 
+    if df['case_submitter_id'].astype(str).duplicated().any():
+        raise ValueError('Duplicate patient IDs; refusing patient-overlapping CV.')
     class_counts = df['label'].value_counts()
     if len(class_counts) != 2 or class_counts.min() < N_SPLITS:
         raise ValueError(
@@ -158,75 +164,112 @@ def train_and_validate(seed, df, feat_root):
     oof_probs = np.full(len(df), np.nan, dtype=float)
     oof_counts = np.zeros(len(df), dtype=int)
 
-    for fold, (train_idx, val_idx) in enumerate(splits):
-        tr_df, v_df = df.iloc[train_idx], df.iloc[val_idx]
-        
-        # Sample weight balancing
-        counts = np.bincount(tr_df['label'])
+    fold_records = []
+    for fold, (development_idx, test_idx) in enumerate(splits):
+        train_idx, validation_idx, inner_seed = make_inner_split(
+            development_idx, test_idx, y, seed, fold, VALIDATION_FRACTION,
+        )
+        split = record_fold_split(
+            seed_dir / f"split_fold_{fold}.json", X,
+            train_idx, validation_idx, test_idx, seed, fold, inner_seed,
+            VALIDATION_FRACTION, MONITOR_MODE, MAX_EPOCHS,
+        )
+        tr_df, validation_df = df.iloc[train_idx], df.iloc[validation_idx]
+        test_df = df.iloc[test_idx]
+        counts = np.bincount(tr_df['label'], minlength=2)
         weights = 1. / torch.tensor(counts, dtype=torch.float)
         samples_weights = weights[tr_df['label'].values]
         sampler = WeightedRandomSampler(samples_weights, len(tr_df), replacement=True)
-
         train_loader = DataLoader(SprintDataset(tr_df, feat_root, True, SAMPLE_SIZE), batch_size=1, sampler=sampler)
-        val_loader = DataLoader(SprintDataset(v_df, feat_root, False, SAMPLE_SIZE), batch_size=1)
-        
+        validation_loader = DataLoader(SprintDataset(validation_df, feat_root, False, SAMPLE_SIZE), batch_size=1)
+
         model = SelfCalibrationMIL(input_dim=INPUT_DIM).to(DEVICE)
         optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-2)
         criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
-        
-        best_val_m = 0
+        selection = BestCheckpoint(allow_ties=True)
         fold_path = seed_dir / f"model_fold_{fold}.pth"
-        
-        for epoch in range(1, 101):
+        history = []
+        print(f"Seed {seed} fold {fold + 1}/{N_SPLITS}: "
+              f"train={len(train_idx)}, internal_validation={len(validation_idx)}, "
+              f"outer_test={len(test_idx)}", flush=True)
+
+        for epoch in range(1, MAX_EPOCHS + 1):
             model.train()
+            losses = []
             for bags, label in train_loader:
                 logits = model(bags.squeeze(0).to(DEVICE))
                 loss = criterion(logits, label.to(DEVICE))
+                if not torch.isfinite(loss):
+                    raise ValueError('Nonfinite training loss')
                 optimizer.zero_grad(); loss.backward(); optimizer.step()
-            
+                losses.append(float(loss.detach()))
+
+            # Only INTERNAL validation can influence checkpoint selection.
             model.eval()
             v_probs, v_preds, v_labels = [], [], []
             with torch.no_grad():
-                for bags, label in val_loader:
+                for bags, label in validation_loader:
                     logits = model(bags.squeeze(0).to(DEVICE))
                     v_probs.append(F.softmax(logits, dim=1)[:, 1].item())
                     v_preds.append(torch.argmax(logits, 1).item())
                     v_labels.append(label.item())
-            
             acc = accuracy_score(v_labels, v_preds)
-            try: auc = roc_auc_score(v_labels, v_probs)
-            except: auc = 0.5
-            
-            curr_m = auc if MONITOR_MODE == "AUC" else acc
-            if curr_m >= best_val_m:
-                best_val_m = curr_m
+            auc = roc_auc_score(v_labels, v_probs)
+            validation_score = auc if MONITOR_MODE == "AUC" else acc
+            improved = selection.update(validation_score, epoch)
+            if improved:
                 torch.save(model.state_dict(), fold_path)
+            history.append({'epoch': epoch, 'loss': float(np.mean(losses)),
+                            'validation_acc': float(acc), 'validation_auroc': float(auc)})
+            if epoch == 1 or epoch % 10 == 0 or epoch == MAX_EPOCHS:
+                save_json(seed_dir / f"progress_fold_{fold}.json", {
+                    'status': 'selecting_on_internal_validation', 'seed': seed, 'fold': fold,
+                    'epochs_run': epoch, 'best_epoch': selection.best_epoch, 'history': history,
+                })
+                print(f"  epoch={epoch} internal_val_{MONITOR_MODE}={validation_score:.4f} "
+                      f"best_epoch={selection.best_epoch}", flush=True)
 
-        # Load the best model and predict this fold's held-out samples once.
-        model.load_state_dict(torch.load(fold_path, map_location=DEVICE))
+        # Construct/read the test loader only AFTER the checkpoint is selected.
+        model.load_state_dict(torch.load(fold_path, map_location=DEVICE, weights_only=True))
         model.eval()
-        fold_val_probs = []
+        test_loader = DataLoader(SprintDataset(test_df, feat_root, False, SAMPLE_SIZE), batch_size=1)
+        fold_test_probs = []
         with torch.no_grad():
-            for bags, _ in val_loader:
+            for bags, _ in test_loader:
                 logits = model(bags.squeeze(0).to(DEVICE))
-                fold_val_probs.append(F.softmax(logits, dim=1)[:, 1].item())
-
-        fold_auc = roc_auc_score(v_df['label'].values, fold_val_probs)
+                fold_test_probs.append(F.softmax(logits, dim=1)[:, 1].item())
+        fold_auc = roc_auc_score(test_df['label'].values, fold_test_probs)
         fold_aurocs.append(fold_auc)
-        assign_oof(oof_probs, oof_counts, val_idx, fold_val_probs)
-        print(
-            f"Seed {seed} fold {fold + 1}/{N_SPLITS} "
-            f"held-out AUROC: {fold_auc:.4f}"
-        )
+        assign_oof(oof_probs, oof_counts, test_idx, fold_test_probs)
+        record = {
+            'protocol': PROTOCOL_VERSION, 'seed': seed, 'fold': fold,
+            'epochs_run': epoch, 'best_epoch': selection.best_epoch,
+            'best_internal_validation_score': selection.best_score,
+            'test_auroc': float(fold_auc), 'history': history,
+            'train_patients': split['train_patients'],
+            'validation_patients': split['validation_patients'],
+            'test_patients': split['test_patients'],
+            'test_predictions': [
+                {'patient_id': str(X[i]), 'label': int(y[i]), 'score': float(score)}
+                for i, score in zip(test_idx, fold_test_probs)
+            ],
+        }
+        save_json(seed_dir / f"result_fold_{fold}.json", record)
+        fold_records.append(record)
+        print(f"Seed {seed} fold {fold + 1}/{N_SPLITS} outer-test AUROC: {fold_auc:.4f} "
+              f"epochs_run={epoch} best_epoch={selection.best_epoch}", flush=True)
 
     require_complete_oof(oof_counts)
     pooled_oof_auroc = roc_auc_score(y, oof_probs)
-    return build_classification_result(
+    result = build_classification_result(
         fold_aurocs,
         pooled_oof_auroc=pooled_oof_auroc,
         coverage=int(oof_counts.sum()),
         n_samples=len(df),
     )
+    result.update(protocol=PROTOCOL_VERSION, seed=int(seed), folds=fold_records)
+    save_json(seed_dir / 'result.json', result)
+    return result
 
 # ==========================================
 # 4. Main Program: Data Loading and Experiment Loop
@@ -265,14 +308,14 @@ if __name__ == "__main__":
         seed_fold_means = [result['fold_mean'] for result in seed_results]
         seed_pooled_aurocs = [result['pooled_oof_auroc'] for result in seed_results]
         final_mean = np.mean(seed_fold_means)
-        final_std = np.std(seed_fold_means)
+        final_std = np.std(seed_fold_means, ddof=1)
 
         print("\n" + "*" * 40)
-        print(f"FINAL TRUE {N_SPLITS}-FOLD ROBUSTNESS REPORT")
+        print(f"FINAL OUTER-TEST {N_SPLITS}-FOLD ROBUSTNESS REPORT")
         print(f"Seeds: {TEST_SEEDS}")
         print(f"Per-seed fold mean AUROC: {[round(x, 4) for x in seed_fold_means]}")
         print(f"Mean AUROC: {final_mean:.4f}")
-        print(f"Std Dev:    {final_std:.4f}")
+        print(f"Sample SD across seeds:    {final_std:.4f}")
         print(f"Per-seed pooled OOF AUROC: {[round(x, 4) for x in seed_pooled_aurocs]}")
         print(f"Mean pooled OOF AUROC: {np.mean(seed_pooled_aurocs):.4f}")
         print(f"Checkpoints saved in: {CHECKPOINT_ROOT}")

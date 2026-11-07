@@ -17,5 +17,8 @@ checkpoints/
 *.hdf5
 *.log
 
-# Local development checks; not part of the source release.
-/tests/
+# Local model checks remain private; publish the CV protocol regression tests.
+/tests/*
+!/tests/test_cv_protocol.py
+
+.cv-test-*/
