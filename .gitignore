@@ -1,0 +1,23 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+wandb/
+outputs/
+data/
+checkpoints/
+*.pt
+*.pth
+*.ckpt
+*.h5
+*.hdf5
+*.log
+
+# Keep local tests out of the published repository.
+/tests/
+
+.cv-test-*/
